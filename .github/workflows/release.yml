@@ -10,62 +10,125 @@ on:
         description: 'Tag to build (e.g., v0.1.0)'
         required: false
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    name: Build binaries
+    name: Build ${{ matrix.target }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            ext: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            ext: ""
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            ext: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            ext: ".exe"
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            archive: zip
+            ext: ".exe"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Determine tag
         id: vars
         shell: bash
         run: |
+          git fetch --force --tags
           if [[ -n "${{ github.event.inputs.tag }}" ]]; then
             echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
-          else
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          else
+            latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
+            if [[ -n "$latest_tag" ]]; then
+              echo "tag=$latest_tag" >> $GITHUB_OUTPUT
+            else
+              echo "No tag specified and no tags found. Please provide a tag input." >&2
+              exit 1
+            fi
           fi
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (Linux musl)
+        if: startsWith(matrix.target, 'x86_64-unknown-linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        shell: bash
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release 2>&1 | tee build.log
+        run: cargo build --release --target ${{ matrix.target }} 2>&1 | tee build.log
         shell: bash
 
-
-
       - name: Package
+        env:
+          BIN: rusk-socks5
         run: |
+          set -euxo pipefail
           mkdir -p dist
-          BIN=rusk-socks5
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp target/release/${BIN}.exe dist/${BIN}-windows-x64.exe
-            7z a dist/${BIN}-windows-x64.zip dist/${BIN}-windows-x64.exe
-            rm dist/${BIN}-windows-x64.exe
-          elif [[ "${{ runner.os }}" == "macOS" ]]; then
-            cp target/release/${BIN} dist/${BIN}-macos
-            tar -C dist -czf dist/${BIN}-macos.tar.gz ${BIN}-macos
-            rm dist/${BIN}-macos
+          BIN_PATH=target/${{ matrix.target }}/release/${BIN}${{ matrix.ext }}
+          if [[ ! -f "$BIN_PATH" ]]; then
+            echo "Binary not found: $BIN_PATH" >&2
+            ls -lah target/${{ matrix.target }}/release || true
+            exit 1
+          fi
+
+          out_base="${BIN}-${{ matrix.target }}"
+          cp "$BIN_PATH" "dist/${out_base}${{ matrix.ext }}"
+
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a "dist/${out_base}.zip" "dist/${out_base}${{ matrix.ext }}"
+            rm -f "dist/${out_base}${{ matrix.ext }}"
           else
-            cp target/release/${BIN} dist/${BIN}-linux-x64
-            tar -C dist -czf dist/${BIN}-linux-x64.tar.gz ${BIN}-linux-x64
-            rm dist/${BIN}-linux-x64
+            tar -C dist -czf "dist/${out_base}.tar.gz" "${out_base}${{ matrix.ext }}"
+            rm -f "dist/${out_base}${{ matrix.ext }}"
           fi
         shell: bash
 
-      - name: Upload artifacts
+      - name: Create/Update GitHub Release and upload assets
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.vars.outputs.tag }}
+          name: ${{ steps.vars.outputs.tag }}
+          commit: ${{ github.sha }}
+          generateReleaseNotes: true
+          allowUpdates: true
+          makeLatest: true
+          artifacts: "dist/*"
+          artifactErrorsFailBuild: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: ${{ contains(steps.vars.outputs.tag, '-') }}
+
+      - name: Upload artifacts (Actions)
         uses: actions/upload-artifact@v4
         with:
-          name: rusk-socks5-${{ runner.os }}-${{ steps.vars.outputs.tag }}
+          name: rusk-socks5-${{ matrix.target }}-${{ steps.vars.outputs.tag }}
           path: dist/*
